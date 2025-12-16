@@ -1,5 +1,8 @@
 import os
 import time
+import hashlib
+import json
+from datetime import datetime
 import torch
 import torch.nn as nn
 import numpy as np
@@ -9,6 +12,15 @@ import timm
 import torch.multiprocessing as mp
 from pathlib import Path
 from collections import defaultdict
+
+
+def set_seed(seed: int = 42):
+    """Set all random seeds for reproducibility."""
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    np.random.seed(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
 
 
 class CNNViTHybrid(nn.Module):
@@ -135,6 +147,9 @@ class CNNViTHybrid(nn.Module):
 # Optimized for TI IWR6843ISK Range-Doppler maps
 # Modify these values to tune the model
 CONFIG = {
+    # Reproducibility
+    "seed": 42,                 # Random seed for reproducibility
+    
     # Data
     "data_dir": "splits",
     "image_size": 224,
@@ -164,9 +179,19 @@ CONFIG = {
     "noise_factor": 0.05,       # More noise for robustness (small dataset needs more augmentation)
     "random_crop": True,        # Random crop helps with slight spatial variations
     
+    # Production settings
+    "confidence_threshold": 0.5, # Reject predictions below this confidence (medical safety)
+    "compile_model": False,      # Use torch.compile() for faster inference (requires PyTorch 2.0+)
+    
     # Output
     "save_path": "cnn_vit_radar.pt",
 }
+
+
+def get_config_hash(config: dict) -> str:
+    """Generate a hash of the config for tracking."""
+    config_str = json.dumps(config, sort_keys=True)
+    return hashlib.md5(config_str.encode()).hexdigest()[:8]
 
 
 class AddGaussianNoise:
@@ -183,6 +208,11 @@ class AddGaussianNoise:
 
 
 def main():
+    # Set seed for reproducibility
+    set_seed(CONFIG["seed"])
+    print(f"Random seed: {CONFIG['seed']}")
+    print(f"Config hash: {get_config_hash(CONFIG)}")
+    
     # Validate data directory exists
     data_path = Path(CONFIG["data_dir"])
     if not data_path.exists():
@@ -321,6 +351,13 @@ def main():
     avg_inference_ms = (end_time - start_time) / num_runs * 1000
     fps = 1000 / avg_inference_ms
     print(f"Inference speed: {avg_inference_ms:.2f} ms/image ({fps:.1f} FPS)")
+    
+    # Optional: Compile model for faster inference (PyTorch 2.0+)
+    if CONFIG["compile_model"] and hasattr(torch, "compile"):
+        print("Compiling model with torch.compile()...")
+        model = torch.compile(model)
+        print("Model compiled successfully")
+    
     print("-" * 60)
 
     opt = torch.optim.AdamW(
@@ -414,6 +451,17 @@ def main():
                     "num_heads": CONFIG["num_heads"],
                     "num_layers": CONFIG["num_layers"],
                     "dropout": CONFIG["dropout"]
+                },
+                # Production metadata
+                "metadata": {
+                    "trained_at": datetime.now().isoformat(),
+                    "config_hash": get_config_hash(CONFIG),
+                    "pytorch_version": torch.__version__,
+                    "best_val_accuracy": acc,
+                    "train_samples": len(train_ds),
+                    "val_samples": len(val_ds),
+                    "confidence_threshold": CONFIG["confidence_threshold"],
+                    "seed": CONFIG["seed"],
                 }
             }, CONFIG["save_path"])
             print(f"  -> Saved new best model with acc {acc:.3f}")
