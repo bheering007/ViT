@@ -2,6 +2,7 @@
 """
 Lightweight Edge Inference Script for Raspberry Pi / Jetson
 Optimized for TI IWR6843ISK Range-Doppler radar classification
+Supports both single-frame and sequence (streaming) models.
 
 Requirements:
     pip install torch torchvision timm pillow numpy
@@ -10,21 +11,31 @@ Usage:
     python infer_edge.py <image_path>
     python infer_edge.py <image_path> --threshold 0.6
     python infer_edge.py --benchmark
+    python infer_edge.py --stream <folder>    # Streaming mode
     
 For integration:
-    from infer_edge import RadarClassifier
+    from infer_edge import RadarClassifier, StreamingClassifier
+    
+    # Single frame
     classifier = RadarClassifier("cnn_vit_radar.pt")
     result = classifier.predict("image.png")
+    
+    # Streaming
+    streamer = StreamingClassifier("cnn_vit_lstm_radar.pt")
+    while True:
+        result = streamer.update(get_frame())
 """
 import sys
 import os
 import time
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import numpy as np
 from pathlib import Path
 from dataclasses import dataclass
 from typing import Optional, List, Tuple
+from collections import deque
 
 # Conditional imports for edge devices
 try:
@@ -50,6 +61,17 @@ class PredictionResult:
     confidence: float
     is_reliable: bool
     all_probs: List[Tuple[str, float]]
+
+
+@dataclass
+class StreamPrediction:
+    """Result from streaming classifier."""
+    prediction: str
+    confidence: float
+    is_reliable: bool
+    all_probs: List[Tuple[str, float]]
+    frame_count: int
+    latency_ms: float
 
 
 class CNNViTHybrid(nn.Module):
@@ -121,6 +143,93 @@ class CNNViTHybrid(nn.Module):
         x = self.norm(x[:, 0])
         x = self.head(x)
         return x
+    
+    def forward_features(self, x):
+        """Extract spatial features without classification."""
+        B = x.shape[0]
+        features = self.cnn_backbone(x)
+        x = features[-1]
+        x = self.patch_embed(x)
+        x = x.flatten(2).transpose(1, 2)
+        cls_tokens = self.cls_token.expand(B, -1, -1)
+        x = torch.cat([cls_tokens, x], dim=1)
+        x = x + self.pos_embed
+        x = self.pos_drop(x)
+        x = self.transformer(x)
+        return self.norm(x[:, 0])
+
+
+class TemporalEncoder(nn.Module):
+    """LSTM/GRU encoder for temporal modeling."""
+    
+    def __init__(self, input_dim, hidden_dim=256, num_layers=2, 
+                 dropout=0.3, bidirectional=True, model_type='lstm'):
+        super().__init__()
+        
+        self.bidirectional = bidirectional
+        self.hidden_dim = hidden_dim
+        
+        RNN = nn.LSTM if model_type == 'lstm' else nn.GRU
+        self.rnn = RNN(
+            input_dim, hidden_dim, num_layers=num_layers, batch_first=True,
+            dropout=dropout if num_layers > 1 else 0, bidirectional=bidirectional
+        )
+        self.output_dim = hidden_dim * (2 if bidirectional else 1)
+    
+    def forward(self, x):
+        output, _ = self.rnn(x)
+        if self.bidirectional:
+            return torch.cat([output[:, -1, :self.hidden_dim], 
+                            output[:, 0, self.hidden_dim:]], dim=1)
+        return output[:, -1, :]
+
+
+class CNNViTSequence(nn.Module):
+    """Sequence model: CNN-ViT per frame + LSTM across frames."""
+    
+    def __init__(self, num_classes, config):
+        super().__init__()
+        
+        self.spatial_encoder = CNNViTHybrid(
+            num_classes=num_classes,
+            backbone=config.get("backbone", "resnet18"),
+            embed_dim=config.get("embed_dim", 256),
+            num_heads=config.get("num_heads", 4),
+            num_layers=config.get("num_layers", 4),
+            dropout=config.get("dropout", 0.1)
+        )
+        
+        self.temporal_encoder = TemporalEncoder(
+            input_dim=config.get("embed_dim", 256),
+            hidden_dim=config.get("temporal_hidden", 256),
+            num_layers=config.get("temporal_layers", 2),
+            dropout=config.get("temporal_dropout", 0.3),
+            bidirectional=config.get("temporal_bidirectional", True),
+            model_type=config.get("temporal_model", "lstm")
+        )
+        
+        temporal_dim = self.temporal_encoder.output_dim
+        self.classifier = nn.Sequential(
+            nn.Linear(temporal_dim, temporal_dim // 2),
+            nn.GELU(),
+            nn.Dropout(config.get("classifier_dropout", 0.4)),
+            nn.Linear(temporal_dim // 2, num_classes)
+        )
+    
+    def forward(self, x):
+        B, T, C, H, W = x.shape
+        x = x.view(B * T, C, H, W)
+        spatial_features = self.spatial_encoder.forward_features(x)
+        spatial_features = spatial_features.view(B, T, -1)
+        temporal_features = self.temporal_encoder(spatial_features)
+        return self.classifier(temporal_features)
+    
+    def forward_spatial_only(self, x):
+        return self.spatial_encoder.forward_features(x)
+    
+    def forward_temporal_only(self, spatial_features):
+        temporal_features = self.temporal_encoder(spatial_features)
+        return self.classifier(temporal_features)
 
 
 class RadarClassifier:
@@ -273,6 +382,157 @@ class RadarClassifier:
         }
 
 
+class StreamingClassifier:
+    """
+    Real-time streaming classifier with sliding window buffer.
+    For sequence models (CNN-ViT-LSTM).
+    
+    Example:
+        classifier = StreamingClassifier("cnn_vit_lstm_radar.pt")
+        while True:
+            frame = get_radar_frame()
+            result = classifier.update(frame)
+            if result:
+                print(f"{result.prediction}: {result.confidence:.1%}")
+    """
+    
+    def __init__(self, model_path: str, device: str = "auto", smoothing_window: int = 3):
+        if device == "auto":
+            self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        else:
+            self.device = torch.device(device)
+        
+        if not os.path.exists(model_path):
+            raise FileNotFoundError(f"Model not found: {model_path}")
+        
+        ckpt = torch.load(model_path, map_location=self.device, weights_only=False)
+        
+        self.classes = ckpt["classes"]
+        self.config = ckpt.get("model_config", {})
+        self.sequence_length = self.config.get("sequence_length", 8)
+        self.confidence_threshold = ckpt.get("metadata", {}).get("confidence_threshold", 0.5)
+        
+        mode = self.config.get("mode", "single")
+        
+        if mode == "sequence":
+            self.model = CNNViTSequence(num_classes=len(self.classes), config=self.config)
+        else:
+            self.model = CNNViTHybrid(
+                num_classes=len(self.classes),
+                backbone=self.config.get("backbone", "resnet18"),
+                embed_dim=self.config.get("embed_dim", 256),
+                num_heads=self.config.get("num_heads", 4),
+                num_layers=self.config.get("num_layers", 4),
+                dropout=self.config.get("dropout", 0.1)
+            )
+            self.sequence_length = 1
+        
+        self.model.load_state_dict(ckpt["model"])
+        self.model.to(self.device)
+        self.model.eval()
+        
+        self.transform = transforms.Compose([
+            transforms.Grayscale(num_output_channels=3),
+            transforms.Resize((224, 224)),
+            transforms.ToTensor(),
+            transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225)),
+        ])
+        
+        self.feature_buffer = deque(maxlen=self.sequence_length)
+        self.prediction_history = deque(maxlen=smoothing_window)
+        self.frame_count = 0
+        self.mode = mode
+    
+    def _preprocess(self, image_input) -> torch.Tensor:
+        if isinstance(image_input, torch.Tensor):
+            return image_input
+        elif isinstance(image_input, np.ndarray):
+            if image_input.ndim == 2:
+                image_input = np.stack([image_input] * 3, axis=-1)
+            img = Image.fromarray(image_input.astype(np.uint8))
+            return self.transform(img)
+        elif isinstance(image_input, (str, Path)):
+            img = Image.open(image_input).convert('RGB')
+            return self.transform(img)
+        elif hasattr(image_input, 'convert'):
+            return self.transform(image_input)
+        else:
+            raise TypeError(f"Unsupported input type: {type(image_input)}")
+    
+    @torch.no_grad()
+    def update(self, frame) -> Optional[StreamPrediction]:
+        """Add a new frame and get prediction if buffer is full."""
+        start_time = time.perf_counter()
+        
+        tensor = self._preprocess(frame).unsqueeze(0).to(self.device)
+        self.frame_count += 1
+        
+        if self.mode == "sequence":
+            features = self.model.forward_spatial_only(tensor)
+            self.feature_buffer.append(features)
+            
+            if len(self.feature_buffer) < self.sequence_length:
+                return None
+            
+            feature_seq = torch.cat(list(self.feature_buffer), dim=0).unsqueeze(0)
+            logits = self.model.forward_temporal_only(feature_seq)
+        else:
+            logits = self.model(tensor)
+        
+        probs = F.softmax(logits, dim=1)[0]
+        
+        self.prediction_history.append(probs.cpu())
+        if len(self.prediction_history) > 1:
+            avg_probs = torch.stack(list(self.prediction_history)).mean(dim=0)
+        else:
+            avg_probs = probs.cpu()
+        
+        confidence, pred_idx = avg_probs.max(0)
+        confidence = confidence.item()
+        pred_idx = pred_idx.item()
+        
+        latency_ms = (time.perf_counter() - start_time) * 1000
+        
+        all_probs = [(self.classes[i], avg_probs[i].item()) for i in range(len(self.classes))]
+        all_probs.sort(key=lambda x: x[1], reverse=True)
+        
+        return StreamPrediction(
+            prediction=self.classes[pred_idx],
+            confidence=confidence,
+            is_reliable=confidence >= self.confidence_threshold,
+            all_probs=all_probs,
+            frame_count=self.frame_count,
+            latency_ms=latency_ms
+        )
+    
+    def reset(self):
+        self.feature_buffer.clear()
+        self.prediction_history.clear()
+        self.frame_count = 0
+    
+    def benchmark(self, n_frames: int = 100) -> dict:
+        dummy = torch.randn(1, 3, 224, 224).to(self.device)
+        
+        self.reset()
+        for _ in range(self.sequence_length + 5):
+            self.update(dummy[0].cpu().numpy().transpose(1, 2, 0).astype(np.uint8))
+        
+        self.reset()
+        latencies = []
+        for _ in range(n_frames):
+            result = self.update(dummy[0].cpu().numpy().transpose(1, 2, 0).astype(np.uint8))
+            if result:
+                latencies.append(result.latency_ms)
+        
+        return {
+            "mean_ms": np.mean(latencies) if latencies else 0,
+            "std_ms": np.std(latencies) if latencies else 0,
+            "fps": 1000 / np.mean(latencies) if latencies else 0,
+            "sequence_length": self.sequence_length,
+            "mode": self.mode
+        }
+
+
 def main():
     """CLI entry point."""
     if len(sys.argv) < 2:
@@ -281,21 +541,25 @@ def main():
     
     # Find model file
     script_dir = Path(__file__).parent
-    model_paths = [
-        script_dir / "cnn_vit_radar.pt",
-        script_dir.parent / "cnn_vit_radar.pt",
-        Path("cnn_vit_radar.pt"),
-    ]
+    
+    # Determine which model to look for
+    if "--stream" in sys.argv or "--stream-benchmark" in sys.argv:
+        model_names = ["cnn_vit_lstm_radar.pt"]
+    else:
+        model_names = ["cnn_vit_radar.pt", "cnn_vit_lstm_radar.pt"]
     
     model_path = None
-    for p in model_paths:
-        if p.exists():
-            model_path = str(p)
+    for name in model_names:
+        for p in [script_dir / name, script_dir.parent / name, Path(name)]:
+            if p.exists():
+                model_path = str(p)
+                break
+        if model_path:
             break
     
     if model_path is None:
-        print("Error: cnn_vit_radar.pt not found")
-        print("Searched in:", [str(p) for p in model_paths])
+        print(f"Error: Model not found")
+        print(f"Looked for: {model_names}")
         return 1
     
     # Parse args
@@ -304,7 +568,56 @@ def main():
         idx = sys.argv.index("--threshold")
         threshold = float(sys.argv[idx + 1])
     
-    # Initialize classifier
+    # Handle streaming benchmark
+    if "--stream-benchmark" in sys.argv:
+        print(f"Loading streaming model: {model_path}")
+        classifier = StreamingClassifier(model_path)
+        print(f"Device: {classifier.device}")
+        print(f"Mode: {classifier.mode}")
+        print(f"Sequence length: {classifier.sequence_length}")
+        
+        print("\nRunning streaming benchmark...")
+        results = classifier.benchmark()
+        print(f"Latency: {results['mean_ms']:.2f} ± {results['std_ms']:.2f} ms")
+        print(f"FPS: {results['fps']:.1f}")
+        print(f"30 FPS capable: {'✓ YES' if results['fps'] > 30 else '✗ NO'}")
+        return 0
+    
+    # Handle streaming mode
+    if "--stream" in sys.argv:
+        idx = sys.argv.index("--stream")
+        if idx + 1 >= len(sys.argv):
+            print("Error: --stream requires a folder path")
+            return 1
+        
+        stream_path = Path(sys.argv[idx + 1])
+        fps = 30
+        if "--fps" in sys.argv:
+            fps_idx = sys.argv.index("--fps")
+            fps = int(sys.argv[fps_idx + 1])
+        
+        print(f"Loading streaming model: {model_path}")
+        classifier = StreamingClassifier(model_path)
+        print(f"Device: {classifier.device}")
+        print(f"Simulating {fps} FPS stream")
+        print("-" * 40)
+        
+        frame_delay = 1.0 / fps
+        frames = sorted(list(stream_path.glob("*.png")) + list(stream_path.glob("*.jpg")))
+        
+        try:
+            for frame_path in frames:
+                result = classifier.update(frame_path)
+                if result:
+                    status = "✓" if result.is_reliable else "?"
+                    print(f"[{status}] {result.prediction:12s} {result.confidence:5.1%} ({result.latency_ms:.1f}ms)")
+                time.sleep(frame_delay)
+        except KeyboardInterrupt:
+            print("\nStopped.")
+        
+        return 0
+    
+    # Standard single-frame inference
     print(f"Loading model from: {model_path}")
     classifier = RadarClassifier(model_path)
     print(f"Device: {classifier.device}")
