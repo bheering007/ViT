@@ -34,7 +34,7 @@ class CNNViTHybrid(nn.Module):
     }
     
     def __init__(self, num_classes, embed_dim=384, num_heads=6, num_layers=6, 
-                 dropout=0.1, pretrained_backbone=True, backbone='resnet18'):
+                 dropout=0.1, pretrained_backbone=True, backbone='resnet34'):
         super().__init__()
         
         self.backbone_name = backbone
@@ -147,14 +147,14 @@ CONFIG = {
     "embed_dim": 256,           # Reduced for small dataset (less overfitting)
     "num_heads": 4,             # Attention heads (must divide embed_dim evenly)
     "num_layers": 4,            # Reduced transformer layers (less overfitting)
-    "dropout": 0.3,             # Higher dropout for small dataset
+    "dropout": 0.2,             # Moderate dropout
     
     # Training
     "epochs": 100,              # Max epochs (early stopping will likely trigger first)
-    "learning_rate": 3e-4,      # Slightly higher LR for smaller model
-    "weight_decay": 0.1,        # Stronger L2 regularization for small dataset
-    "label_smoothing": 0.2,     # Higher smoothing prevents overconfident predictions
-    "early_stopping_patience": 10, # More patience with regularization
+    "learning_rate": 2e-4,      # Balanced LR
+    "weight_decay": 0.05,       # Moderate L2 regularization
+    "label_smoothing": 0.05,     # Back to normal - 0.2 was too aggressive
+    "early_stopping_patience": 15, # More patience with regularization
     
     # Range-Doppler specific augmentation
     # NOTE: Horizontal flip is DISABLED - flipping range is physically meaningless
